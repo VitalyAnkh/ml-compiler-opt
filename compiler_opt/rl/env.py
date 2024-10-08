@@ -24,13 +24,13 @@ import abc
 import contextlib
 import io
 import os
-import tempfile
 from typing import Callable, Generator, List, Optional, Tuple, Type
 
 import numpy as np
 
 from compiler_opt.rl import corpus
 from compiler_opt.rl import log_reader
+from compiler_opt.rl import compilation_runner
 
 
 class StepType(Enum):
@@ -47,6 +47,7 @@ class TimeStep:
   score_default: Optional[dict[str, float]]
   context: Optional[str]
   module_name: str
+  working_dir: str
   obs_id: Optional[int]
   step_type: StepType
 
@@ -115,10 +116,12 @@ class ClangProcess:
   """
 
   def __init__(self, proc: subprocess.Popen,
-               get_scores_fn: Callable[[], dict[str, float]], module_name):
+               get_scores_fn: Callable[[], dict[str, float]], module_name: str,
+               working_dir: str):
     self._proc = proc
     self._get_scores_fn = get_scores_fn
     self._module_name = module_name
+    self._working_dir = working_dir
 
   def get_scores(self, timeout: Optional[int] = None):
     self._proc.wait(timeout=timeout)
@@ -133,10 +136,11 @@ class InteractiveClang(ClangProcess):
       proc: subprocess.Popen,
       get_scores_fn: Callable[[], dict[str, float]],
       module_name: str,
+      working_dir: str,
       reader_pipe: io.BufferedReader,
       writer_pipe: io.BufferedWriter,
   ):
-    super().__init__(proc, get_scores_fn, module_name)
+    super().__init__(proc, get_scores_fn, module_name, working_dir)
     self._reader_pipe = reader_pipe
     self._writer_pipe = writer_pipe
     self._obs_gen = log_reader.read_log_from_file(self._reader_pipe)
@@ -150,6 +154,7 @@ class InteractiveClang(ClangProcess):
         score_default=None,
         context=None,
         module_name=module_name,
+        working_dir=working_dir,
         obs_id=None,
         step_type=StepType.LAST,
     )
@@ -180,6 +185,7 @@ class InteractiveClang(ClangProcess):
           score_default=None,
           context=obs.context,
           module_name=self._module_name,
+          working_dir=self._working_dir,
           obs_id=obs.observation_id,
           step_type=_get_step_type(),
       )
@@ -235,7 +241,8 @@ def clang_session(
   Yields:
     Either the constructed InteractiveClang or DefaultClang object.
   """
-  with tempfile.TemporaryDirectory() as td:
+  tempdir_context = compilation_runner.get_workdir_context()
+  with tempdir_context as td:
     task_working_dir = os.path.join(td, '__task_working_dir__')
     os.mkdir(task_working_dir)
     task = task_type()
@@ -264,6 +271,7 @@ def clang_session(
                   proc,
                   _get_scores,
                   module.name,
+                  task_working_dir,
                   reader_pipe,
                   writer_pipe,
               )
@@ -272,6 +280,7 @@ def clang_session(
               proc,
               _get_scores,
               module.name,
+              task_working_dir,
           )
 
       finally:
@@ -281,18 +290,23 @@ def clang_session(
 def _get_clang_generator(
     clang_path: str,
     task_type: Type[MLGOTask],
+    interactive_only: bool = False,
 ) -> Generator[Optional[Tuple[ClangProcess, InteractiveClang]],
                Optional[corpus.LoadedModuleSpec], None]:
-  """Returns a generator for creating InteractiveClang objects.
-
-  TODO: fix this docstring
+  """Returns a tuple of generators for creating InteractiveClang objects.
 
   Args:
     clang_path: Path to the clang binary to use within InteractiveClang.
     task_type: Type of the MLGO task to use.
+    interactive_only: If set to true the returned tuple of generators is
+      iclang, iclang instead of iclang, clang
 
   Returns:
-    The generator for InteractiveClang objects.
+    A generator of tuples. Each element of the tuple is created with
+    clang_session. First argument of the tuple is always an interactive
+    clang session. The second argumnet is a default clang session if
+    interactive_only is False and otherwise the exact same interactive
+    clang session object as the first argument.
   """
   while True:
     # The following line should be type-hinted as follows:
@@ -302,9 +316,12 @@ def _get_clang_generator(
     module = yield
     with clang_session(
         clang_path, module, task_type, interactive=True) as iclang:
-      with clang_session(
-          clang_path, module, task_type, interactive=False) as clang:
-        yield iclang, clang
+      if interactive_only:
+        yield iclang, iclang
+      else:
+        with clang_session(
+            clang_path, module, task_type, interactive=False) as clang:
+          yield iclang, clang
 
 
 class MLGOEnvironmentBase:
@@ -323,8 +340,10 @@ class MLGOEnvironmentBase:
       task_type: Type[MLGOTask],
       obs_spec,
       action_spec,
+      interactive_only: bool = False,
   ):
-    self._clang_generator = _get_clang_generator(clang_path, task_type)
+    self._clang_generator = _get_clang_generator(
+        clang_path, task_type, interactive_only=interactive_only)
     self._obs_spec = obs_spec
     self._action_spec = action_spec
 
@@ -359,6 +378,7 @@ class MLGOEnvironmentBase:
     self._clang_generator.send(None)
     # pytype: disable=attribute-error
     self._iclang, self._clang = self._clang_generator.send(module)
+    # pytype: enable=attribute-error
     return self._get_observation()
 
   def step(self, action: np.ndarray):

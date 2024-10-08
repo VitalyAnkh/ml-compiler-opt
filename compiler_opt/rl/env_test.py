@@ -19,6 +19,9 @@ import contextlib
 import ctypes
 from unittest import mock
 import subprocess
+import os
+import tempfile
+from absl.testing import flagsaver
 
 from typing import Dict, List, Optional
 
@@ -161,6 +164,30 @@ class ClangSessionTest(tf.test.TestCase):
         self.assertEqual(obs.context, f'context_{idx}')
       mock_popen.assert_called_once()
 
+  @mock.patch('subprocess.Popen')
+  def test_interactive_clang_temp_dir(self, mock_popen):
+    mock_popen.side_effect = mock_interactive_clang
+    working_dir = None
+
+    with env.clang_session(
+        _CLANG_PATH, _MOCK_MODULE, MockTask, interactive=True) as clang_session:
+      for _ in range(_NUM_STEPS):
+        obs = clang_session.get_observation()
+        working_dir = obs.working_dir
+        self.assertEqual(os.path.exists(working_dir), True)
+    self.assertEqual(os.path.exists(working_dir), False)
+
+    with tempfile.TemporaryDirectory() as td:
+      with flagsaver.flagsaver((env.compilation_runner._KEEP_TEMPS, td)):  # pylint: disable=protected-access
+        with env.clang_session(
+            _CLANG_PATH, _MOCK_MODULE, MockTask,
+            interactive=True) as clang_session:
+          for _ in range(_NUM_STEPS):
+            obs = clang_session.get_observation()
+            working_dir = obs.working_dir
+            self.assertEqual(os.path.exists(working_dir), True)
+        self.assertEqual(os.path.exists(working_dir), True)
+
 
 class MLGOEnvironmentTest(tf.test.TestCase):
 
@@ -187,6 +214,33 @@ class MLGOEnvironmentTest(tf.test.TestCase):
 
       step = test_env.step(np.array([1], dtype=np.int64))
       self.assertEqual(step.step_type, env.StepType.LAST)
+      self.assertNotEqual(test_env._iclang, test_env._clang)  # pylint: disable=protected-access
+
+  @mock.patch('subprocess.Popen')
+  def test_env_interactive_only(self, mock_popen):
+    mock_popen.side_effect = mock_interactive_clang
+
+    test_env = env.MLGOEnvironmentBase(
+        clang_path=_CLANG_PATH,
+        task_type=MockTask,
+        obs_spec={},
+        action_spec={},
+        interactive_only=True,
+    )
+
+    for env_itr in range(3):
+      del env_itr
+      step = test_env.reset(_MOCK_MODULE)
+      self.assertEqual(step.step_type, env.StepType.FIRST)
+
+      for step_itr in range(_NUM_STEPS - 1):
+        del step_itr
+        step = test_env.step(np.array([1], dtype=np.int64))
+        self.assertEqual(step.step_type, env.StepType.MID)
+
+      step = test_env.step(np.array([1], dtype=np.int64))
+      self.assertEqual(step.step_type, env.StepType.LAST)
+      self.assertEqual(test_env._iclang, test_env._clang)  # pylint: disable=protected-access
 
 
 if __name__ == '__main__':
